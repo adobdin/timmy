@@ -19,40 +19,17 @@
 main module
 """
 
-import json
-import os
-import shutil
-import logging
-import sys
-import re
-from datetime import datetime, date, timedelta
-import urllib2
-import tools
-from tools import w_list, run_with_lock
 from copy import deepcopy
-
-try:
-    import fuelclient
-    if hasattr(fuelclient, 'connect'):
-        # fuel > 9.0.1
-        from fuelclient import connect as FuelClient
-        FUEL_10 = True
-    else:
-        import fuelclient.client
-        if type(fuelclient.client.APIClient) is fuelclient.client.Client:
-            # fuel 9.0.1 and below
-            from fuelclient.client import Client as FuelClient
-            FUEL_10 = False
-        else:
-            FuelClient = None
-except:
-    FuelClient = None
-
-try:
-    from fuelclient.client import logger
-    logger.handlers = []
-except:
-    pass
+from datetime import datetime, date, timedelta
+from timmy import conf
+from timmy.env import project_name, version
+from timmy import tools
+from tools import w_list, run_with_lock
+import logging
+import os
+import re
+import shutil
+import sys
 
 
 class Node(object):
@@ -74,8 +51,8 @@ class Node(object):
 
     def __init__(self, ip, conf, id=None, name=None, fqdn=None, mac=None,
                  cluster=None, roles=None, os_platform=None,
-                 online=True, status="ready", logger=None):
-        self.logger = logger or logging.getLogger(__name__)
+                 online=True, status="ready", logger=None, network_data=None):
+        self.logger = logger or logging.getLogger(project_name)
         self.id = int(id) if id is not None else None
         self.mac = mac
         self.cluster = int(cluster) if cluster is not None else None
@@ -90,6 +67,7 @@ class Node(object):
             self.logger.critical('Node: ip address must be defined')
             sys.exit(111)
         self.ip = ip
+        self.network_data = network_data
         self.release = None
         self.files = []
         self.filelists = []
@@ -104,7 +82,7 @@ class Node(object):
         self.name = name
         self.fqdn = fqdn
         self.accessible = True
-        self.filtered_out = False
+        self.skipped = False
         self.outputs_timestamp = False
         self.outputs_timestamp_dir = None
         self.apply_conf(conf)
@@ -119,10 +97,10 @@ class Node(object):
         return self.pt.format(*fields)
 
     def print_table(self):
-        if not self.filtered_out:
+        if not self.skipped:
             my_id = self.id
         else:
-            my_id = str(self.id) + ' [skipped]'
+            my_id = '%s [skipped]' % self.id
         return [str(my_id), str(self.cluster), str(self.ip), str(self.mac),
                 self.os_platform, ','.join(self.roles),
                 str(self.online), str(self.accessible), str(self.status),
@@ -186,60 +164,6 @@ class Node(object):
                 setattr(self, f, [])
         r_apply(conf, p, c_a, k_d, overridden, d, clean=clean)
 
-    def get_release(self):
-        if self.id == 0:
-            cmd = ("awk -F ':' '/release/ {print $2}' "
-                   "/etc/nailgun/version.yaml")
-        else:
-            cmd = ("awk -F ':' '/fuel_version/ {print $2}' "
-                   "/etc/astute.yaml")
-        release, err, code = tools.ssh_node(ip=self.ip,
-                                            command=cmd,
-                                            ssh_opts=self.ssh_opts,
-                                            timeout=self.timeout,
-                                            prefix=self.prefix)
-        if code != 0:
-            self.logger.warning('%s: could not determine'
-                                ' MOS release' % self.repr)
-            release = 'n/a'
-        else:
-            release = release.strip('\n "\'')
-        self.logger.info('%s, MOS release: %s' %
-                         (self.repr, release))
-        return release
-
-    def get_roles_hiera(self):
-        def trim_primary(roles):
-            trim_roles = [r for r in roles if not r.startswith('primary-')]
-            trim_roles += [r[8:] for r in roles if r.startswith('primary-')]
-            return trim_roles
-
-        self.logger.debug('%s: roles not defined, trying hiera' % self.repr)
-        cmd = 'hiera roles'
-        outs, errs, code = tools.ssh_node(ip=self.ip,
-                                          command=cmd,
-                                          ssh_opts=self.ssh_opts,
-                                          env_vars=self.env_vars,
-                                          timeout=self.timeout,
-                                          prefix=self.prefix)
-        self.check_code(code, 'get_roles_hiera', cmd, errs, [0])
-        if code == 0:
-            try:
-                roles = trim_primary(json.loads(outs))
-            except:
-                self.logger.warning("%s: failed to parse '%s' output as JSON" %
-                                    (self.repr, cmd))
-                return self.roles
-            self.logger.debug('%s: got roles: %s' % (self.repr, roles))
-            if roles is not None:
-                return roles
-            else:
-                return self.roles
-        else:
-            self.logger.warning("%s: failed to load roles via hiera" %
-                                self.repr)
-            self.roles
-
     def get_os(self):
         self.logger.debug('%s: os_platform not defined, trying to determine' %
                           self.repr)
@@ -251,20 +175,6 @@ class Node(object):
                                           timeout=self.timeout,
                                           prefix=self.prefix)
         return 'centos' if code else 'ubuntu'
-
-    def get_cluster_id(self):
-        self.logger.debug('%s: cluster id not defined, trying to determine' %
-                          self.repr)
-        astute_file = '/etc/astute.yaml'
-        cmd = ("python -c 'import yaml; a = yaml.load(open(\"%s\")"
-               ".read()); print a[\"cluster\"][\"id\"]'" % astute_file)
-        outs, errs, code = tools.ssh_node(ip=self.ip,
-                                          command=cmd,
-                                          ssh_opts=self.ssh_opts,
-                                          env_vars=self.env_vars,
-                                          timeout=self.timeout,
-                                          prefix=self.prefix)
-        return int(outs.rstrip('\n')) if code == 0 else None
 
     def check_access(self):
         self.logger.debug('%s: verifyng node access' %
@@ -281,6 +191,34 @@ class Node(object):
         else:
             self.logger.info('%s: not accessible' % self.repr)
             return False
+
+    @property
+    def scripts_ddir(self):
+        return os.path.join(self.outdir, Node.skey, self.cluster_repr,
+                            self.repr)
+
+    def generate_mapscr(self):
+        mapscr = {}
+        for scr in self.scripts:
+            if type(scr) is dict:
+                env_vars = scr.values()[0]
+                scr = scr.keys()[0]
+            else:
+                env_vars = self.env_vars
+            if os.path.sep in scr:
+                script_path = scr
+            else:
+                script_path = os.path.join(self.rqdir, Node.skey, scr)
+            self.logger.debug('%s, exec: %s' % (self.repr, script_path))
+            output_path = os.path.join(self.scripts_ddir,
+                                       os.path.basename(script_path))
+            if self.outputs_timestamp:
+                output_path += self.outputs_timestamp_str
+            self.logger.debug('outfile: %s' % output_path)
+            mapscr[scr] = {'env_vars': env_vars,
+                           'script_path': script_path,
+                           'output_path': output_path}
+        self.mapscr = mapscr
 
     def exec_cmd(self, fake=False, ok_codes=None):
         cl = self.cluster_repr
@@ -314,41 +252,26 @@ class Node(object):
                         self.logger.error("can't write to file %s" %
                                           dfile)
         if self.scripts:
-            ddir = os.path.join(self.outdir, Node.skey, cl, self.repr)
-            tools.mdir(ddir)
-            self.scripts = sorted(self.scripts)
-        mapscr = {}
-        for scr in self.scripts:
-            if type(scr) is dict:
-                env_vars = scr.values()[0]
-                scr = scr.keys()[0]
-            else:
-                env_vars = self.env_vars
-            if os.path.sep in scr:
-                f = scr
-            else:
-                f = os.path.join(self.rqdir, Node.skey, scr)
-            self.logger.debug('%s, exec: %s' % (self.repr, f))
-            dfile = os.path.join(ddir, os.path.basename(f))
-            if self.outputs_timestamp:
-                    dfile += self.outputs_timestamp_str
-            self.logger.debug('outfile: %s' % dfile)
-            mapscr[scr] = dfile
-            if not fake:
-                outs, errs, code = tools.ssh_node(ip=self.ip,
-                                                  filename=f,
-                                                  ssh_opts=self.ssh_opts,
-                                                  env_vars=env_vars,
-                                                  timeout=self.timeout,
-                                                  prefix=self.prefix)
-                self.check_code(code, 'exec_cmd', 'script %s' % f, errs,
-                                ok_codes)
-                try:
-                    with open(dfile, 'w') as df:
-                        df.write(outs.encode('utf-8'))
-                except:
-                    self.logger.error("can't write to file %s" % dfile)
-        return mapcmds, mapscr
+            self.generate_mapscr()
+            tools.mdir(self.scripts_ddir)
+        for scr, param in self.mapscr.items():
+            if fake:
+                continue
+            outs, errs, code = tools.ssh_node(ip=self.ip,
+                                              filename=param['script_path'],
+                                              ssh_opts=self.ssh_opts,
+                                              env_vars=param['env_vars'],
+                                              timeout=self.timeout,
+                                              prefix=self.prefix)
+            self.check_code(code, 'exec_cmd',
+                            'script %s' % param['script_path'], errs, ok_codes)
+            try:
+                with open(param['output_path'], 'w') as df:
+                    df.write(outs.encode('utf-8'))
+            except:
+                self.logger.error("can't write to file %s"
+                                  % param['output_path'])
+        return mapcmds, self.mapscr
 
     def exec_simple_cmd(self, cmd, timeout=15, infile=None, outfile=None,
                         fake=False, ok_codes=None, input=None, decode=True):
@@ -365,6 +288,80 @@ class Node(object):
                                               input=input,
                                               prefix=self.prefix)
             self.check_code(code, 'exec_simple_cmd', cmd, errs, ok_codes)
+
+    def exec_pair(self, phase, server_node=None, fake=False):
+        sn = server_node
+        cl = self.cluster_repr
+        if sn:
+            self.logger.debug('%s: phase %s: server %s' % (self.repr, phase,
+                                                           sn.repr))
+        else:
+            self.logger.debug('%s: phase %s' % (self.repr, phase))
+        nond_msg = ('%s: network specified but network_data not set for %s')
+        nonet_msg = ('%s: network %s not found in network_data of %s')
+        nosrv_msg = ('%s: server_node not provided')
+        noip_msg = ('%s: %s has no IP in network %s')
+        for i in self.scripts_all_pairs:
+            if phase not in i:
+                self.logger.warning('phase %s not defined in config' % phase)
+                return self.scripts_all_pairs
+            if phase.startswith('client'):
+                if not sn:
+                    self.logger.warning(nosrv_msg % self.repr)
+                    return self.scripts_all_pairs
+                if 'network' in i:
+                    if not sn.network_data:
+                        self.logger.warning(nond_msg % (self.repr, sn.repr))
+                        return self.scripts_all_pairs
+                    nd = sn.network_data
+                    net_dict = dict((v['name'], v) for v in nd)
+                    if i['network'] not in net_dict:
+                        self.logger.warning(nonet_msg % (self.repr, sn.repr))
+                        return self.scripts_all_pairs
+                    if 'ip' not in net_dict[i['network']]:
+                        self.logger.warning(noip_msg % (self.repr, sn.repr,
+                                                        i['network']))
+                        return self.scripts_all_pairs
+                    ip = net_dict[i['network']]['ip']
+                    if '/' in ip:
+                        server_ip = ip.split('/')[0]
+                    else:
+                        server_ip = ip
+                else:
+                    server_ip = sn.ip
+            phase_val = i[phase]
+            ddir = os.path.join(self.outdir, 'scripts_all_pairs', cl, phase,
+                                self.repr)
+            tools.mdir(ddir)
+            if type(phase_val) is dict:
+                env_vars = [phase_val.values()[0]]
+                phase_val = phase_val.keys()[0]
+            else:
+                env_vars = self.env_vars
+            if os.path.sep in phase_val:
+                f = phase_val
+            else:
+                f = os.path.join(self.rqdir, Node.skey, phase_val)
+            dfile = os.path.join(ddir, os.path.basename(f))
+            if phase.startswith('client'):
+                env_vars.append('SERVER_IP=%s' % server_ip)
+                dname = os.path.basename(f) + '-%s' % server_ip
+                dfile = os.path.join(ddir, dname)
+            elif phase == 'server_stop' and 'server_output' in i:
+                env_vars.append('SERVER_OUTPUT=%s' % i['server_output'])
+            if fake:
+                return self.scripts_all_pairs
+            outs, errs, code = tools.ssh_node(ip=self.ip,
+                                              filename=f,
+                                              ssh_opts=self.ssh_opts,
+                                              env_vars=env_vars,
+                                              timeout=self.timeout,
+                                              prefix=self.prefix)
+            self.check_code(code, 'exec_pair, phase:%s' % phase, f, errs)
+            if phase == 'server_start' and code == 0:
+                i['server_output'] = outs.strip()
+            open(dfile, 'a+').write(outs)
+        return self.scripts_all_pairs
 
     def get_files(self, timeout=15):
         self.logger.info('%s: getting files' % self.repr)
@@ -390,12 +387,14 @@ class Node(object):
             o, e, c = tools.get_files_rsync(ip=self.ip,
                                             data=data,
                                             ssh_opts=self.ssh_opts,
+                                            rsync_opts=self.rsync_opts,
                                             dpath=ddir,
                                             timeout=self.timeout)
             self.check_code(c, 'get_files', 'tools.get_files_rsync', e)
         for f in self.files:
             outs, errs, code = tools.get_file_scp(ip=self.ip,
                                                   file=f,
+                                                  ssh_opts=self.ssh_opts,
                                                   ddir=ddir,
                                                   recursive=True)
             self.check_code(code, 'get_files', 'tools.get_file_scp', errs)
@@ -406,10 +405,14 @@ class Node(object):
             outs, errs, code = tools.put_file_scp(ip=self.ip,
                                                   file=f[0],
                                                   dest=f[1],
+                                                  ssh_opts=self.ssh_opts,
                                                   recursive=True)
             self.check_code(code, 'put_files', 'tools.put_file_scp', errs)
 
-    def logs_populate(self, timeout=5, logs_excluded_nodes=[]):
+    def log_item_manipulate(self, item):
+        pass
+
+    def logs_populate(self, timeout=5):
 
         def filter_by_re(item, string):
             return (('include' not in item or not item['include'] or
@@ -418,20 +421,7 @@ class Node(object):
                      any([re.search(e, string) for e in item['exclude']])))
 
         for item in self.logs:
-            if self.logs_no_fuel_remote and 'fuel' in self.roles:
-                self.logger.debug('adding Fuel remote logs to exclude list')
-                if 'exclude' not in item:
-                    item['exclude'] = []
-                for remote_dir in self.logs_fuel_remote_dir:
-                    item['exclude'].append(remote_dir)
-            if 'fuel' in self.roles:
-                for n in logs_excluded_nodes:
-                    self.logger.debug('removing remote logs for node:%s' % n)
-                    if 'exclude' not in item:
-                        item['exclude'] = []
-                    for remote_dir in self.logs_fuel_remote_dir:
-                        ipd = os.path.join(remote_dir, n)
-                        item['exclude'].append(ipd)
+            self.log_item_manipulate(item)
             start_str = None
             if 'start' in item or hasattr(self, 'logs_days'):
                 if hasattr(self, 'logs_days') and 'start' not in item:
@@ -515,18 +505,40 @@ class Node(object):
             short_repr = self.ip
         output = []
         for cmd in sorted(result_map):
-            with open(result_map[cmd], 'r') as f:
+            if type(result_map[cmd]) is dict:
+                path = result_map[cmd]['output_path']
+            else:
+                path = result_map[cmd]
+            if not os.path.exists(path):
+                self.logger.warning("File %s does not exist" % path)
+                continue
+            with open(path, 'r') as f:
                 for line in f.readlines():
                     output.append(line.rstrip('\n'))
         return short_repr, output
 
 
 class NodeManager(object):
-    """Class nodes """
+    """Class NodeManager """
 
-    def __init__(self, conf, extended=False, nodes_json=None, logger=None):
+    @staticmethod
+    def load_conf(filename):
+        config = conf.init_default_conf()
+        config = conf.update_conf(config, filename)
+        return config
+
+    def __init__(self, conf, nodes_json, logger=None):
+        self.base_init(conf, logger)
+        self.nodes_json = tools.load_json_file(nodes_json)
+        self.nodes_init(Node)
+        self.post_init()
+
+    def nodes_init_fallbacks(self):
+        self.nodes_get_os()
+
+    def base_init(self, conf, logger=None):
         self.conf = conf
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logger or logging.getLogger(project_name)
         if conf['outputs_timestamp'] or conf['dir_timestamp']:
             timestamp_str = datetime.now().strftime('_%F_%H-%M-%S')
             if conf['outputs_timestamp']:
@@ -536,6 +548,14 @@ class NodeManager(object):
                 conf['archive_dir'] += timestamp_str
         if conf['clean']:
             shutil.rmtree(conf['outdir'], ignore_errors=True)
+        tools.mdir(conf['outdir'])
+        version_filename = '%s_version.txt' % project_name
+        version_filepath = os.path.join(conf['outdir'], version_filename)
+        with open(version_filepath, 'a') as f:
+            now = datetime.now()
+            ver_msg = 'running timmy version %s' % version
+            f.write('%s: %s\n' % (now, ver_msg))
+            self.logger.info(ver_msg)
         if not conf['shell_mode']:
             self.rqdir = conf['rqdir']
             if (not os.path.exists(self.rqdir)):
@@ -545,74 +565,17 @@ class NodeManager(object):
             if self.conf['rqfile']:
                 self.import_rq()
         self.nodes = {}
-        self.token = self.conf['fuel_api_token']
-        self.fuel_init()
-        # save os environment variables
-        environ = os.environ
-        self.logs_excluded_nodes = []
-        if FuelClient and conf['fuelclient']:
-            try:
-                if self.conf['fuel_skip_proxy']:
-                    os.environ['HTTPS_PROXY'] = ''
-                    os.environ['HTTP_PROXY'] = ''
-                    os.environ['https_proxy'] = ''
-                    os.environ['http_proxy'] = ''
-                self.logger.info('Setup fuelclient instance')
-                if FUEL_10:
-                    args = {'host': self.conf['fuel_ip'],
-                            'port': self.conf['fuel_port']}
-                    if self.conf['fuel_user']:
-                        args['os_username'] = self.conf['fuel_user']
-                    if self.conf['fuel_pass']:
-                        args['os_password'] = self.conf['fuel_pass']
-                    if self.conf['fuel_tenant']:
-                        args['os_tenant_name'] = self.conf['fuel_tenant']
-                    self.fuelclient = FuelClient(**args)
-                else:
-                    self.fuelclient = FuelClient()
-                    if self.conf['fuel_user']:
-                        self.fuelclient.username = self.conf['fuel_user']
-                    if self.conf['fuel_pass']:
-                        self.fuelclient.password = self.conf['fuel_pass']
-                    if self.conf['fuel_tenant']:
-                        self.fuelclient.tenant_name = self.conf['fuel_tenant']
-                    # self.fuelclient.debug_mode(True)
-            except Exception as e:
-                self.logger.info('Failed to setup fuelclient instance:%s' % e,
-                                 exc_info=True)
-                self.fuelclient = None
-        else:
-            self.logger.info('Skipping setup fuelclient instance')
-            self.fuelclient = None
-        if nodes_json:
-            self.nodes_json = tools.load_json_file(nodes_json)
-        else:
-            if (not self.get_nodes_fuelclient() and
-                    not self.get_nodes_api() and
-                    not self.get_nodes_cli()):
-                sys.exit(105)
-        self.nodes_init()
-        self.nodes_check_access()
-        # get release information for all nodes
-        if (not self.get_release_fuel_client() and
-                not self.get_release_api() and
-                not self.get_release_cli()):
-            self.logger.warning('could not get Fuel and MOS versions')
+
+    def apply_soft_filter(self):
         # apply soft-filter on all nodes
         for node in self.nodes.values():
             if not self.filter(node, self.conf['soft_filter']):
-                node.filtered_out = True
-                if self.conf['logs_exclude_filtered']:
-                    self.logs_excluded_nodes.append(node.fqdn)
-                    self.logs_excluded_nodes.append(node.ip)
-        else:
-            if self.nodes_json:
-                self.nodes_get_roles_hiera()
-                self.nodes_get_os()
-                self.nodes_get_cluster_ids()
-            self.nodes_reapply_conf()
-            self.conf_assign_once()
-        os.environ = environ
+                node.skipped = True
+
+    def post_init(self):
+        self.nodes_reapply_conf()
+        self.apply_soft_filter()
+        self.conf_assign_once()
 
     def __str__(self):
         def ml_column(matrix, i):
@@ -706,211 +669,23 @@ class NodeManager(object):
         for rqfile in self.conf['rqfile']:
             merge_rq(rqfile, dst)
 
-    def fuel_init(self):
-        if not self.conf['fuel_ip']:
-            self.logger.critical('NodeManager: fuel_ip not set')
-            sys.exit(106)
-        fuelnode = Node(id=0,
-                        cluster=0,
-                        name='fuel',
-                        fqdn='n/a',
-                        mac='n/a',
-                        os_platform='centos',
-                        roles=['fuel'],
-                        status='ready',
-                        online=True,
-                        ip=self.conf['fuel_ip'],
-                        conf=self.conf)
-        fuelnode.cluster_repr = ""
-        fuelnode.repr = "fuel"
-        # soft-skip Fuel if it is hard-filtered
-        if not self.filter(fuelnode, self.conf['hard_filter']):
-            fuelnode.filtered_out = True
-        self.nodes[self.conf['fuel_ip']] = fuelnode
-
-    def get_nodes_fuelclient(self):
-        if not self.fuelclient:
-            return False
-        try:
-            self.logger.info('using fuelclient to get nodes json')
-            self.nodes_json = self.fuelclient.get_request('nodes')
-            return True
-        except Exception as e:
-            self.logger.warning(("NodeManager: can't "
-                                 "get node list from fuel client:\n%s" % (e)),
-                                exc_info=True)
-            return False
-
-    def get_release_api(self):
-        self.logger.info('getting release via API')
-        version_json = self.get_api_request('version')
-        if version_json:
-            version = json.loads(version_json)
-            fuel = self.nodes[self.conf['fuel_ip']]
-            fuel.release = version['release']
-        else:
-            return False
-        clusters_json = self.get_api_request('clusters')
-        if clusters_json:
-            clusters = json.loads(clusters_json)
-            self.set_nodes_release(clusters)
-            return True
-        else:
-            return False
-
-    def get_release_fuel_client(self):
-        if not self.fuelclient:
-            return False
-        self.logger.info('getting release via fuelclient')
-        try:
-            v = self.fuelclient.get_request('version')
-            fuel_version = v['release']
-            self.logger.debug('version response:%s' % v)
-            clusters = self.fuelclient.get_request('clusters')
-            self.logger.debug('clusters response:%s' % clusters)
-        except:
-            self.logger.warning(("Can't get fuel version or "
-                                 "clusters information"))
-            return False
-        self.nodes[self.conf['fuel_ip']].release = fuel_version
-        self.set_nodes_release(clusters)
-        return True
-
-    def set_nodes_release(self, clusters):
-        cldict = {}
-        for cluster in clusters:
-            cldict[cluster['id']] = cluster
-        if cldict:
-            for node in self.nodes.values():
-                if node.cluster:
-                    node.release = cldict[node.cluster]['fuel_version']
-                else:
-                    # set to n/a or may be fuel_version
-                    if node.id != 0:
-                        node.release = 'n/a'
-                self.logger.info('%s: release: %s' % (node.repr, node.release))
-
-    def auth_token(self):
-        '''Get keystone token to access Nailgun API. Requires Fuel 5+'''
-        if self.token:
-            return True
-        self.logger.info('getting token for Nailgun')
-        v2_body = ('{"auth": {"tenantName": "%s", "passwordCredentials": {'
-                   '"username": "%s", "password": "%s"}}}')
-        # v3 not fully implemented yet
-        # v3_body = ('{ "auth": {'
-        #            '  "scope": {'
-        #            '    "project": {'
-        #            '      "name": "%s",'
-        #            '      "domain": { "id": "default" }'
-        #            '    }'
-        #            '  },'
-        #            '  "identity": {'
-        #            '    "methods": ["password"],'
-        #            '    "password": {'
-        #            '      "user": {'
-        #            '        "name": "%s",'
-        #            '        "domain": { "id": "default" },'
-        #            '        "password": "%s"'
-        #            '      }'
-        #            '    }'
-        #            '  }'
-        #            '}}')
-        # Sticking to v2 API for now because Fuel 9.1 has a custom
-        # domain_id defined in keystone.conf which we do not know.
-        args = {'user': None, 'pass': None, 'tenant': None}
-        for a in args:
-            if self.conf['fuel_%s' % a]:
-                args[a] = self.conf['fuel_%s' % a]
-            else:
-                args[a] = self.conf['fuel_api_%s' % a]
-        req_data = v2_body % (args['tenant'], args['user'], args['pass'])
-        req = urllib2.Request("http://%s:%s/v2.0/tokens" %
-                              (self.conf['fuel_ip'],
-                               self.conf['fuel_api_keystone_port']), req_data,
-                              {'Content-Type': 'application/json'})
-        try:
-            # Disabling v3 token retrieval for now
-            # token = urllib2.urlopen(req).info().getheader('X-Subject-Token')
-            result = urllib2.urlopen(req)
-            resp_body = result.read()
-            resp_json = json.loads(resp_body)
-            token = resp_json['access']['token']['id']
-            self.token = token
-            return True
-        except:
-            return False
-
-    def get_api_request(self, request):
-        if self.auth_token():
-            url = "http://%s:%s/api/%s" % (self.conf['fuel_ip'],
-                                           self.conf['fuel_api_port'],
-                                           request)
-            req = urllib2.Request(url, None, {'X-Auth-Token': self.token})
-            try:
-                result = urllib2.urlopen(req)
-                code = result.getcode()
-                if code == 200:
-                    return result.read()
-                else:
-                    self.logger.error('NodeManager: cannot get API response'
-                                      ' from %s, code %s' % (url, code))
-            except:
-                pass
-
-    def get_nodes_api(self):
-        self.logger.info('using API to get nodes json')
-        nodes_json = self.get_api_request('nodes')
-        if nodes_json:
-            self.nodes_json = json.loads(nodes_json)
-            return True
-        else:
-            return False
-
-    def get_nodes_cli(self):
-        self.logger.info('using CLI to get nodes json')
-        fuelnode = self.nodes[self.conf['fuel_ip']]
-        fuel_node_cmd = ('fuel node list --json --user %s --password %s' %
-                         (self.conf['fuel_user'],
-                          self.conf['fuel_pass']))
-        nodes_json, err, code = tools.ssh_node(ip=fuelnode.ip,
-                                               command=fuel_node_cmd,
-                                               ssh_opts=fuelnode.ssh_opts,
-                                               timeout=fuelnode.timeout,
-                                               prefix=fuelnode.prefix)
-        if code != 0:
-            self.logger.warning(('NodeManager: cannot get '
-                                 'fuel node list from CLI: %s') % err)
-            self.nodes_json = None
-            return False
-        self.nodes_json = json.loads(nodes_json)
-        return True
-
-    def get_release_cli(self):
-        run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out:
-                run_items.append(tools.RunItem(target=node.get_release,
-                                               key=key))
-        result = tools.run_batch(run_items, 100, dict_result=True)
-        if result:
-            for key in result:
-                self.nodes[key].release = result[key]
-            return True
-        else:
-            return False
-
-    def nodes_init(self):
+    def nodes_init(self, NodeClass):
         for node_data in self.nodes_json:
             params = {'conf': self.conf}
             keys = ['id', 'cluster', 'roles', 'fqdn', 'name', 'mac',
-                    'os_platform', 'status', 'online', 'ip']
+                    'os_platform', 'status', 'online', 'ip', 'network_data']
             for key in keys:
                 if key in node_data:
                     params[key] = node_data[key]
-            node = Node(**params)
+            node = NodeClass(**params)
             if self.filter(node, self.conf['hard_filter']):
                 self.nodes[node.ip] = node
+        if self.conf['offline']:
+            for node in self.nodes.values():
+                node.accessible = False
+        else:
+            self.nodes_check_access()
+            self.nodes_init_fallbacks()
 
     def conf_assign_once(self):
         once = Node.conf_once_prefix
@@ -920,7 +695,7 @@ class NodeManager(object):
             attr_name = k[len(once_p):]
             assigned = dict((k, None) for k in self.conf[k])
             for ak in assigned:
-                for node in self.nodes.values():
+                for node in self.selected_nodes.values():
                     if hasattr(node, attr_name) and not assigned[ak]:
                         attr = w_list(getattr(node, attr_name))
                         for v in attr:
@@ -936,47 +711,22 @@ class NodeManager(object):
         for node in self.nodes.values():
             node.apply_conf(self.conf)
 
-    def nodes_get_roles_hiera(self, maxthreads=100):
-        run_items = []
-        for key, node in self.nodes.items():
-            if all([not node.filtered_out, not node.roles,
-                    node.status != 'discover']):
-                run_items.append(tools.RunItem(target=node.get_roles_hiera,
-                                               key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
-        for key in result:
-            if result[key]:
-                self.nodes[key].roles = result[key]
-
     def nodes_get_os(self, maxthreads=100):
         run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out and not node.os_platform:
+        for key, node in self.selected_nodes.items():
+            if not node.os_platform:
                 run_items.append(tools.RunItem(target=node.get_os, key=key))
         result = tools.run_batch(run_items, maxthreads, dict_result=True)
         for key in result:
             if result[key]:
                 self.nodes[key].os_platform = result[key]
 
-    def nodes_get_cluster_ids(self, maxthreads=100):
-        self.logger.debug('getting cluster ids from nodes')
-        run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out and not node.cluster:
-                run_items.append(tools.RunItem(target=node.get_cluster_id,
-                                               key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
-        for key in result:
-            if result[key] is not None:
-                self.nodes[key].cluster = result[key]
-
     def nodes_check_access(self, maxthreads=100):
         self.logger.debug('checking if nodes are accessible')
         run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out:
-                run_items.append(tools.RunItem(target=node.check_access,
-                                               key=key))
+        for key, node in self.selected_nodes.items():
+            run_items.append(tools.RunItem(target=node.check_access,
+                                           key=key))
         result = tools.run_batch(run_items, maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].accessible = result[key]
@@ -1011,11 +761,10 @@ class NodeManager(object):
     @run_with_lock
     def run_commands(self, timeout=15, fake=False, maxthreads=100):
         run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out:
-                run_items.append(tools.RunItem(target=node.exec_cmd,
-                                               args={'fake': fake},
-                                               key=key))
+        for key, node in self.selected_nodes.items():
+            run_items.append(tools.RunItem(target=node.exec_cmd,
+                                           args={'fake': fake},
+                                           key=key))
         result = tools.run_batch(run_items, maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].mapcmds = result[key][0]
@@ -1024,17 +773,14 @@ class NodeManager(object):
     def calculate_log_size(self, timeout=15, maxthreads=100):
         total_size = 0
         run_items = []
-        for key, node in self.nodes.items():
-            if not node.filtered_out:
-                args = {'timeout': timeout,
-                        'logs_excluded_nodes': self.logs_excluded_nodes}
-                run_items.append(tools.RunItem(target=node.logs_populate,
-                                               args=args,
-                                               key=key))
+        for key, node in self.selected_nodes.items():
+            run_items.append(tools.RunItem(target=node.logs_populate,
+                                           args={'timeout': timeout},
+                                           key=key))
         result = tools.run_batch(run_items, maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].logs = result[key]
-        for node in self.nodes.values():
+        for node in self.selected_nodes.values():
             total_size += sum(node.logs_dict().values())
         self.logger.info('Full log size on nodes(with fuel): %d bytes' %
                          total_size)
@@ -1042,8 +788,9 @@ class NodeManager(object):
         return self.alogsize
 
     def is_enough_space(self):
-        tools.mdir(self.conf['outdir'])
-        outs, errs, code = tools.free_space(self.conf['outdir'], timeout=1)
+        tools.mdir(self.conf['archive_dir'])
+        outs, errs, code = tools.free_space(self.conf['archive_dir'],
+                                            timeout=1)
         if code != 0:
             self.logger.error("Can't get free space: %s" % errs)
             return False
@@ -1060,7 +807,7 @@ class NodeManager(object):
             self.logger.error('Not enough space in "%s", logsize: %dMB * %s, '
                               'available: %dMB. Decrease logs_size_coefficient'
                               ' config parameter (--logs-coeff CLI parameter)'
-                              ' or free up space.' % (self.conf['outdir'],
+                              ' or free up space.' % (self.conf['archive_dir'],
                                                       self.alogsize/1024/1024,
                                                       coeff,
                                                       fs/1024))
@@ -1085,7 +832,7 @@ class NodeManager(object):
 
     def find_adm_interface_speed(self):
         '''Returns interface speed through which logs will be dowloaded'''
-        for node in self.nodes.values():
+        for node in self.selected_nodes.values():
             if not (node.ip == 'localhost' or node.ip.startswith('127.')):
                 cmd = ("%s$(/sbin/ip -o route get %s | cut -d' ' -f3)/speed" %
                        ('cat /sys/class/net/', node.ip))
@@ -1113,7 +860,7 @@ class NodeManager(object):
             py_slowpipe = tools.slowpipe % speed
             limitcmd = "| python -c '%s'; exit ${PIPESTATUS}" % py_slowpipe
         run_items = []
-        for node in [n for n in self.nodes.values() if not n.filtered_out]:
+        for node in self.selected_nodes.values():
             if not node.logs_dict():
                 self.logger.info(("%s: no logs to collect") % node.repr)
                 continue
@@ -1142,16 +889,49 @@ class NodeManager(object):
     @run_with_lock
     def get_files(self, timeout=15):
         run_items = []
-        for n in [n for n in self.nodes.values() if not n.filtered_out]:
-            run_items.append(tools.RunItem(target=n.get_files))
+        for node in self.selected_nodes.values():
+            run_items.append(tools.RunItem(target=node.get_files))
         tools.run_batch(run_items, 10)
 
     @run_with_lock
     def put_files(self):
         run_items = []
-        for n in [n for n in self.nodes.values() if not n.filtered_out]:
-            run_items.append(tools.RunItem(target=n.put_files))
+        for node in self.selected_nodes.values():
+            run_items.append(tools.RunItem(target=node.put_files))
         tools.run_batch(run_items, 10)
+
+    @run_with_lock
+    def run_scripts_all_pairs(self, maxthreads, fake=False):
+        if len(self.selected_nodes) < 2:
+            self.logger.warning('less than 2 nodes are available, '
+                                'skipping paired scripts')
+            return
+        run_server_start_items = []
+        run_server_stop_items = []
+        for n in self.selected_nodes.values():
+            start_args = {'phase': 'server_start', 'fake': fake}
+            run_server_start_items.append(tools.RunItem(target=n.exec_pair,
+                                                        args=start_args,
+                                                        key=n.ip))
+            stop_args = {'phase': 'server_stop', 'fake': fake}
+            run_server_stop_items.append(tools.RunItem(target=n.exec_pair,
+                                                       args=stop_args))
+        result = tools.run_batch(run_server_start_items, maxthreads,
+                                 dict_result=True)
+        for key in result:
+            self.nodes[key].scripts_all_pairs = result[key]
+        for pairset in tools.all_pairs(self.selected_nodes.values()):
+            run_client_items = []
+            self.logger.info(['%s->%s' % (p[0].ip, p[1].ip) for p in pairset])
+            for pair in pairset:
+                client = pair[0]
+                server = pair[1]
+                client_args = {'phase': 'client', 'server_node': server,
+                               'fake': fake}
+                run_client_items.append(tools.RunItem(target=client.exec_pair,
+                                                      args=client_args))
+            tools.run_batch(run_client_items, len(run_client_items))
+        tools.run_batch(run_server_stop_items, maxthreads)
 
     def has(self, *keys):
         nodes = {}
@@ -1164,6 +944,10 @@ class NodeManager(object):
                             nodes[k] = []
                         nodes[k].append(n)
         return nodes
+
+    @property
+    def selected_nodes(self):
+        return dict([(ip, n) for ip, n in self.nodes.items() if not n.skipped])
 
 
 def main(argv=None):

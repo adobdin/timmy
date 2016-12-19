@@ -15,14 +15,15 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
+from timmy.analyze import analyze, analyze_print_results
+from timmy.env import project_name, version
+from timmy.nodes import Node
+from timmy.tools import signal_wrapper
 import argparse
-from timmy.nodes import Node, NodeManager
 import logging
-import sys
+import logging.handlers
 import os
-from timmy.conf import load_conf
-from timmy.tools import interrupt_wrapper
-from timmy.env import version
+import sys
 
 
 def pretty_run(quiet, msg, f, args=[], kwargs={}):
@@ -35,22 +36,18 @@ def pretty_run(quiet, msg, f, args=[], kwargs={}):
     return result
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description=('Parallel remote command'
-                                                  ' execution and file'
-                                                  ' manipulation tool'))
+def add_args(parser, module):
+    parser = module.add_args(parser)
+    return parser
+
+
+def parser_init(add_help=False):
+    desc = 'Parallel remote command execution and file manipulation tool'
+    parser = argparse.ArgumentParser(description=desc, add_help=add_help)
     parser.add_argument('-V', '--version', action='store_true',
                         help='Print Timmy version and exit.')
     parser.add_argument('-c', '--config',
                         help='Path to a YAML configuration file.')
-    parser.add_argument('-j', '--nodes-json',
-                        help=('Path to a json file retrieved via'
-                              ' "fuel node --json". Useful to speed up'
-                              ' initialization, skips "fuel node" call.'))
-    parser.add_argument('--fuel-ip', help='fuel ip address')
-    parser.add_argument('--fuel-user', help='fuel username')
-    parser.add_argument('--fuel-pass', help='fuel password')
-    parser.add_argument('--fuel-token', help='fuel auth token')
     parser.add_argument('-o', '--dest-file',
                         help=('Output filename for the archive in tar.gz'
                               ' format for command outputs and collected'
@@ -115,8 +112,6 @@ def parse_args():
                         help=('Do not use default log collection parameters,'
                               ' only use what has been provided either via -L'
                               ' or in rqfile(s). Implies "-l".'))
-    parser.add_argument('--logs-no-fuel-remote', action='store_true',
-                        help='Do not collect remote logs from Fuel.')
     parser.add_argument('--logs-speed', type=int, metavar='MBIT/S',
                         help=('Limit log collection bandwidth to 90%% of the'
                               ' specified speed in Mbit/s.'))
@@ -132,18 +127,16 @@ def parse_args():
                               ' of a total size larger than locally available'
                               '. Values lower than 0.3 are not recommended'
                               ' and may result in filling up local disk.'))
-    parser.add_argument('--fuel-proxy',
-                        help='use os system proxy variables for fuelclient',
-                        action='store_true')
     parser.add_argument('--only-logs',
                         action='store_true',
                         help=('Only collect logs, do not run commands or'
                               ' collect files.'))
+    parser.add_argument('--fake',
+                        help='Do not run commands and scripts',
+                        action='store_true')
     parser.add_argument('--fake-logs',
                         help='Do not collect logs, only calculate size.',
                         action='store_true')
-    parser.add_argument('-x', '--extended', action='store_true',
-                        help='Execute extended commands.')
     parser.add_argument('--no-archive',
                         help=('Do not create results archive. By default,'
                               ' an archive with all outputs and files'
@@ -158,11 +151,11 @@ def parse_args():
                               ' messages. Good for quick runs / "watch" wrap.'
                               ' This option disables any -v parameters.'),
                         action='store_true')
-    parser.add_argument('-m', '--maxthreads', type=int, default=100,
+    parser.add_argument('--maxthreads', type=int, default=100,
                         metavar='NUMBER',
                         help=('Maximum simultaneous nodes for command'
                               'execution.'))
-    parser.add_argument('--logs-maxthreads', type=int, default=100,
+    parser.add_argument('--logs-maxthreads', type=int, default=10,
                         metavar='NUMBER',
                         help='Maximum simultaneous nodes for log collection.')
     parser.add_argument('-t', '--outputs-timestamp',
@@ -179,6 +172,15 @@ def parse_args():
                               ' results. Do not forget to clean up the results'
                               ' manually when using this option.'),
                         action='store_true')
+    parser.add_argument('-m', '--module', metavar='INVENTORY MODULE',
+                        default='fuel',
+                        help='Use module to get node data')
+    parser.add_argument('-a', '--analyze', action='store_true',
+                        help=('Analyze collected outputs to determine node or'
+                              'service health and print results'))
+    parser.add_argument('--offline', action='store_true',
+                        help=('Mark all nodes as offline, do not perform any'
+                              'operations on the nodes'))
     parser.add_argument('-v', '--verbose', action='count', default=0,
                         help=('This works for -vvvv, -vvv, -vv, -v, -v -v,'
                               'etc, If no -v then logging.WARNING is '
@@ -188,39 +190,39 @@ def parse_args():
     return parser
 
 
-@interrupt_wrapper
+@signal_wrapper
 def main(argv=None):
     if argv is None:
         argv = sys.argv
-    parser = parse_args()
+    parser = parser_init()
+    args, unknown = parser.parse_known_args(argv[1:])
+    parser = parser_init(add_help=True)
+    if args.module:
+        inventory = __import__('timmy.modules.%s' % args.module,
+                               fromlist=['timmy.modules'])
+        parser = add_args(parser, inventory)
     args = parser.parse_args(argv[1:])
     if args.version:
         print(version)
-        return 0
+        sys.exit(0)
     loglevels = [logging.WARNING, logging.INFO, logging.DEBUG]
     if args.quiet and not args.log_file:
         args.verbose = 0
     loglevel = loglevels[min(len(loglevels)-1, args.verbose)]
     # always enable debug log if log file specificed
-    loglevel = logging.DEBUG if args.log_file else loglevel
-    FORMAT = ('%(asctime)s %(levelname)s: %(module)s: '
-              '%(funcName)s(): %(message)s')
-    logging.basicConfig(filename=args.log_file,
-                        level=loglevel,
-                        format=FORMAT)
-    logger = logging.getLogger(__name__)
-    conf = load_conf(args.config)
-    if args.fuel_ip:
-        conf['fuel_ip'] = args.fuel_ip
-    if args.fuel_user:
-        conf['fuel_user'] = args.fuel_user
-    if args.fuel_pass:
-        conf['fuel_pass'] = args.fuel_pass
-    if args.fuel_token:
-        conf['fuel_api_token'] = args.fuel_token
-        conf['fuelclient'] = False
-    if args.fuel_proxy:
-        conf['fuel_skip_proxy'] = False
+    if args.log_file:
+        loglevel = logging.DEBUG
+        log_handler = logging.handlers.WatchedFileHandler(args.log_file)
+    else:
+        log_handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s %(levelname)s: %(module)s: '
+                                  '%(funcName)s(): %(message)s')
+    log_handler.setFormatter(formatter)
+    logger = logging.getLogger(project_name)
+    logger.addHandler(log_handler)
+    logger.setLevel(loglevel)
+    conf = inventory.NodeManager.load_conf(args.config)
+    inventory.check_args(args, conf)
     if args.put or args.command or args.script or args.get:
         conf['shell_mode'] = True
         conf['do_print_results'] = True
@@ -235,8 +237,6 @@ def main(argv=None):
     if args.logs_no_default:
         conf['logs_no_default'] = True
         args.logs = True
-    if args.logs_no_fuel_remote:
-        conf['logs_no_fuel_remote'] = True
     if args.logs_speed or args.logs_speed_auto:
         conf['logs_speed_limit'] = True
     if args.logs_speed:
@@ -292,14 +292,23 @@ def main(argv=None):
         conf['dir_timestamp'] = True
     if args.dest_file:
         conf['archive_dir'] = os.path.split(args.dest_file)[0]
+        if not conf['archive_dir']:
+            # this is mainly to see the path in logs instad of ""
+            conf['archive_dir'] = os.getcwd()
         conf['archive_name'] = os.path.split(args.dest_file)[1]
+    if args.analyze:
+        conf['analyze'] = True
+    if args.offline:
+        conf['offline'] = True
     logger.info('Using rqdir: %s, rqfile: %s' %
                 (conf['rqdir'], conf['rqfile']))
     nm = pretty_run(args.quiet, 'Initializing node data',
-                    NodeManager,
-                    kwargs={'conf': conf, 'extended': args.extended,
+                    inventory.NodeManager,
+                    kwargs={'conf': conf,
                             'nodes_json': args.nodes_json})
-    if args.only_logs or args.logs:
+    logs = False
+    if not conf['offline'] and (args.only_logs or args.logs):
+        logs = True
         size = pretty_run(args.quiet, 'Calculating logs size',
                           nm.calculate_log_size, args=(args.maxthreads,))
         if size == 0:
@@ -315,20 +324,27 @@ def main(argv=None):
             if not enough_space:
                 logger.error('Not enough space for logs in "%s", exiting.' %
                              nm.conf['archive_dir'])
-                return 100
-    if not args.only_logs:
+                sys.exit(100)
+    if not conf['offline'] and not args.only_logs:
         if nm.has(Node.pkey):
             pretty_run(args.quiet, 'Uploading files', nm.put_files)
         if nm.has(Node.ckey, Node.skey):
             pretty_run(args.quiet, 'Executing commands and scripts',
-                       nm.run_commands, args=(args.maxthreads,))
+                       nm.run_commands, kwargs={'maxthreads': args.maxthreads,
+                                                'fake': args.fake})
+    if conf['analyze']:
+        pretty_run(args.quiet, 'Analyzing outputs', analyze, args=[nm])
+    if not conf['offline'] and not args.only_logs:
+        if nm.has('scripts_all_pairs'):
+            pretty_run(args.quiet, 'Executing paired scripts',
+                       nm.run_scripts_all_pairs, args=(args.maxthreads,))
         if nm.has(Node.fkey, Node.flkey):
             pretty_run(args.quiet, 'Collecting files and filelists',
                        nm.get_files, args=(args.maxthreads,))
         if not args.no_archive and nm.has(*Node.conf_archive_general):
             pretty_run(args.quiet, 'Creating outputs and files archive',
                        nm.create_archive_general, args=(60,))
-    if (args.only_logs or args.logs) and has_logs and enough_space:
+    if logs and has_logs and enough_space:
         msg = 'Collecting and packing logs'
         pretty_run(args.quiet, msg, nm.get_logs,
                    args=(conf['compress_timeout'],),
@@ -354,10 +370,13 @@ def main(argv=None):
                 for line in output_dict[node.ip]['output']:
                     name = output_dict[node.ip]['name'].rjust(maxlength)
                     print("%s: %s" % (name, line))
-    if nm.has(Node.ckey, Node.skey, Node.fkey, Node.flkey) and not args.quiet:
+    if conf['analyze']:
+        analyze_print_results(nm)
+    if all([nm.has(Node.ckey, Node.skey, Node.fkey, Node.flkey),
+            not args.quiet, not conf['offline']]):
         print('Outputs and/or files available in "%s".' % nm.conf['outdir'])
     if all([not args.no_archive, nm.has(*Node.conf_archive_general),
-            not args.quiet]):
+            not args.quiet, not conf['offline']]):
         print('Archives available in "%s".' % nm.conf['archive_dir'])
 
 if __name__ == '__main__':

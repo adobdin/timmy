@@ -19,20 +19,23 @@
 tools module
 """
 
-import os
+from flock import FLock
+from pipes import quote
+from tempfile import gettempdir
+from timmy.env import project_name
+import Queue
+import json
 import logging
+import multiprocessing as mp
+import os
+import signal
+import subprocess
 import sys
 import threading
-from multiprocessing import Process, Queue, BoundedSemaphore
-import subprocess
+import traceback
 import yaml
-import json
-from flock import FLock
-from tempfile import gettempdir
-from pipes import quote
-import signal
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(project_name)
 slowpipe = '''
 import sys
 import time
@@ -46,14 +49,14 @@ while 1:
 '''
 
 
-def interrupt_wrapper(f):
+def signal_wrapper(f):
     def wrapper(*args, **kwargs):
+        setup_handle_sig()
         try:
             f(*args, **kwargs)
-        except KeyboardInterrupt:
-            logger.warning('Interrupted, exiting.')
-            sys.exit(signal.SIGINT)
         except Exception as e:
+            if not logger.handlers:
+                logging.basicConfig()
             logger.error('Error: %s' % e, exc_info=True)
             for k in dir(e):
                 '''debug: print all exception attrs except internal
@@ -61,7 +64,49 @@ def interrupt_wrapper(f):
                 if not k.startswith('__') and k != 'message':
                     v = getattr(e, k)
                     logger.debug('Error details: %s = %s' % (k, v))
+            sys.exit(113)
     return wrapper
+
+
+def handle_sig_usr1(sig, frame):
+    debug_msg = 'Pid %d received USR1, printing current stack:'
+    logger.critical(debug_msg % os.getpid())
+    for line in traceback.format_stack(frame):
+        for subline in line.splitlines():
+            logger.critical(subline.rstrip())
+
+
+def main_handle_sig(sig, frame):
+    sig_msg = 'main application received signal %d, sending to children'
+    logger.warning(sig_msg % sig)
+    pids, errs, code = launch_cmd('pgrep -P %d' % os.getpid(), 2)
+    if pids:
+        for pid in pids.splitlines():
+            try:
+                os.kill(int(pid), sig)
+            except OSError:
+                pass
+    sys.exit(sig)
+
+
+def sub_handle_sig(sig, frame):
+    sig_msg = 'subprocess received signal %d, sending to children, pid: %d'
+    logger.warning(sig_msg % (sig, os.getpid()))
+    signal.signal(sig, signal.SIG_IGN)
+    try:
+        os.killpg(os.getpid(), sig)
+    except OSError:
+        pass
+    sys.exit(sig)
+
+
+def setup_handle_sig(subprocess=False):
+    if os.getpid() != os.getpgrp():
+        os.setpgrp()
+    sig_handler = main_handle_sig if not subprocess else sub_handle_sig
+    for sig in [signal.SIGINT, signal.SIGTERM, signal.SIGHUP]:
+        signal.signal(sig, sig_handler)
+    signal.signal(signal.SIGUSR1, handle_sig_usr1)
 
 
 def run_with_lock(f):
@@ -83,13 +128,13 @@ class RunItem():
         self.key = key
         self.process = None
         self.queue = None
-        self.logger = logger or logging.getLogger(__name__)
+        self.logger = logger or logging.getLogger(project_name)
 
 
-class SemaphoreProcess(Process):
+class SemaphoreProcess(mp.Process):
     def __init__(self, semaphore, target, args=None, queue=None, logger=None):
-        Process.__init__(self)
-        self.logger = logger or logging.getLogger(__name__)
+        mp.Process.__init__(self)
+        self.logger = logger or logging.getLogger(project_name)
         self.semaphore = semaphore
         self.target = target
         if not args:
@@ -98,55 +143,94 @@ class SemaphoreProcess(Process):
         self.queue = queue
 
     def run(self):
+        setup_handle_sig(subprocess=True)
+        fin_msg = 'finished subprocess, pid: %s'
+        sem_msg = 'semaphore released by subprocess, pid: %s'
         try:
             result = self.target(**self.args)
             if self.queue:
                 self.queue.put_nowait(result)
         except Exception as error:
-            self.logger.exception(error)
             if self.queue:
                 self.queue.put_nowait(error)
+                self.queue.put_nowait(traceback.format_exc())
         finally:
-            self.logger.debug('finished call: %s' % self.target)
+            self.logger.debug(fin_msg % self.pid)
             self.semaphore.release()
-            self.logger.debug('semaphore released')
+            self.logger.debug(sem_msg % self.pid)
 
 
 def run_batch(item_list, maxthreads, dict_result=False):
-    def cleanup():
-        logger.debug('cleanup processes')
-        for run_item in item_list:
-            if run_item.process:
-                run_item.process.terminate()
-    semaphore = BoundedSemaphore(maxthreads)
-    try:
-        for run_item in item_list:
-            semaphore.acquire(True)
-            run_item.queue = Queue()
-            p = SemaphoreProcess(target=run_item.target,
-                                 semaphore=semaphore,
-                                 args=run_item.args,
-                                 queue=run_item.queue)
-            run_item.process = p
-            p.start()
-        for run_item in item_list:
-            run_item.result = run_item.queue.get()
-            if isinstance(run_item.result, Exception):
-                logger.critical('%s, exiting' % run_item.result)
-                cleanup()
-                sys.exit(109)
-            run_item.process.join()
-            run_item.process = None
+    exc_msg = 'exception in subprocess, pid: %s, details:'
+    rem_msg = 'removing reference to finished subprocess, pid: %s'
+    emp_msg = 'subprocess did not return results, pid: %s'
+
+    def cleanup(launched):
+        logger.info('cleaning up running subprocesses')
+        for proc in launched.values():
+            logger.debug('terminating subprocess, pid: %s' % proc.pid)
+            proc.terminate()
+            proc.join()
+
+    def get_result(proc, key, results):
+        try:
+            results[key] = proc.queue.get(block=False)
+        except Queue.Empty:
+            if not proc.is_alive():
+                logger.warning(emp_msg % proc.pid)
+
+    def collect_results(l, join=False):
+        results = {}
+        remove_procs = []
+        for key, proc in l.items():
+            if not proc.is_alive() or join:
+                logger.debug('joining subprocess, pid: %s' % proc.pid)
+                while proc.is_alive():
+                    get_result(proc, key, results)
+                    proc.join(timeout=1)
+                if key not in results:
+                    get_result(proc, key, results)
+                if key in results and isinstance(results[key], Exception):
+                    exc_text = proc.queue.get()
+                    logger.critical(exc_msg % proc.pid)
+                    for line in exc_text.splitlines():
+                        logger.critical('____%s' % line)
+                    cleanup(l)
+                    sys.exit(109)
+                remove_procs.append(key)
+        for key in remove_procs:
+            logger.debug(rem_msg % key)
+            l.pop(key)
+        return results
+
+    semaphore = mp.BoundedSemaphore(maxthreads)
+    launched = {}
+    results = {}
+    if not dict_result:
+        key = 0
+    for run_item in item_list:
+        results.update(collect_results(launched))
+        semaphore.acquire(block=True)
+        p = SemaphoreProcess(target=run_item.target,
+                             semaphore=semaphore,
+                             args=run_item.args,
+                             queue=mp.Queue())
+        p.start()
         if dict_result:
-            result = {}
-            for run_item in item_list:
-                result[run_item.key] = run_item.result
-            return result
+            launched[run_item.key] = p
+            logger.debug('started subprocess, pid: %s, func: %s, key: %s' %
+                         (p.pid, run_item.target, run_item.key))
         else:
-            return [run_item.result for run_item in item_list]
-    except KeyboardInterrupt:
-        cleanup()
-        raise KeyboardInterrupt()
+            launched[key] = p
+            key += 1
+            logger.debug('started subprocess, pid:%s, func:%s, key:%s' %
+                         (p.pid, run_item.target, key))
+
+    results.update(collect_results(launched, True))
+    if dict_result:
+        return results
+    else:
+        return results.values()
 
 
 def load_json_file(filename):
@@ -189,11 +273,11 @@ def mdir(directory):
     """
     Creates a directory if it doesn't exist
     """
-    if not os.path.exists(directory):
+    if directory and not os.path.exists(directory):
         logger.debug('creating directory %s' % directory)
         try:
             os.makedirs(directory)
-        except:
+        except OSError:
             logger.critical("Can't create a directory: %s" % directory)
             sys.exit(110)
 
@@ -203,7 +287,7 @@ def launch_cmd(cmd, timeout, input=None, ok_codes=None, decode=True):
         try:
             os.kill(pid, 15)
             logger.error("launch_cmd: pid %d killed by timeout" % pid)
-        except:
+        except OSError:
             pass
 
     logger.debug('cmd: %s' % cmd)
@@ -211,7 +295,7 @@ def launch_cmd(cmd, timeout, input=None, ok_codes=None, decode=True):
                          shell=True,
                          stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE)
+                         stderr=subprocess.PIPE, close_fds=True)
     timeout_killer = None
     outs = None
     errs = None
@@ -228,9 +312,10 @@ def launch_cmd(cmd, timeout, input=None, ok_codes=None, decode=True):
             timeout_killer.cancel()
         input = input.decode('utf-8') if input else None
         logger.debug(('___command: %s\n'
+                      '_______pid: %s\n'
                       '_exit_code: %s\n'
                       '_____stdin: %s\n'
-                      '____stderr: %s') % (cmd, p.returncode, input,
+                      '____stderr: %s') % (cmd, p.pid, p.returncode, input,
                                            errs))
     return outs, errs, p.returncode
 
@@ -251,7 +336,7 @@ def ssh_node(ip, command='', ssh_opts=None, env_vars=None, timeout=15,
         bstr = "%s timeout '%s' bash -c " % (
                env_vars, timeout)
     else:
-        bstr = "timeout '%s' ssh -t -T %s '%s' '%s' " % (
+        bstr = "timeout '%s' ssh -T %s '%s' '%s' " % (
                timeout, ssh_opts, ip, env_vars)
     if filename is None:
         cmd = '%s %s' % (bstr, quote(prefix + ' ' + command))
@@ -272,51 +357,82 @@ def ssh_node(ip, command='', ssh_opts=None, env_vars=None, timeout=15,
                       ok_codes=ok_codes, decode=decode)
 
 
-def get_files_rsync(ip, data, ssh_opts, dpath, timeout=15):
+def get_files_rsync(ip, data, ssh_opts, rsync_opts, dpath, timeout=15):
     if type(ssh_opts) is list:
         ssh_opts = ' '.join(ssh_opts)
+    if type(rsync_opts) is list:
+        rsync_opts = ' '.join(rsync_opts)
     if (ip in ['localhost', '127.0.0.1']) or ip.startswith('127.'):
         logger.info("skip ssh rsync")
-        cmd = ("timeout '%s' rsync -avzr --include-from=- / '%s' --exclude='*'"
-               " --progress --partial --delete-before" %
-               (timeout, dpath))
+        cmd = ("timeout '%s' rsync %s --include-from=- / '%s' --exclude='*'" %
+               (timeout, rsync_opts, dpath))
     else:
-        cmd = ("timeout '%s' rsync -avzr -e 'ssh %s"
-               " -oCompression=no' --include-from=- '%s':/ '%s' --exclude='*'"
-               " --progress --partial --delete-before"
-               ) % (timeout, ssh_opts, ip, dpath)
+        cmd = ("timeout '%s' rsync %s -e 'ssh %s -oCompression=no' "
+               "--include-from=- '%s':/ '%s' --exclude='*'" %
+               (timeout, rsync_opts, ssh_opts, ip, dpath))
     logger.debug("command:%s\ndata:\n%s" % (cmd, data))
     if data == '':
         return cmd, '', 127
     return launch_cmd(cmd, timeout, input=data)
 
 
-def get_file_scp(ip, file, ddir, timeout=600, recursive=False):
+def get_file_scp(ip, file, ddir, ssh_opts, timeout=600, recursive=False):
+    if type(ssh_opts) is list:
+        ssh_opts = ' '.join(ssh_opts)
     dest = os.path.split(os.path.normpath(file).lstrip(os.path.sep))[0]
     ddir = os.path.join(os.path.normpath(ddir), dest)
     mdir(ddir)
     r = '-r ' if recursive else ''
-    cmd = ("timeout '%s' scp -oStrictHostKeyChecking=no -q %s'%s':'%s' '%s'" %
-           (timeout, r, ip, file, ddir))
+    cmd = ("timeout '%s' scp %s -p -q %s'%s':'%s' '%s'" %
+           (timeout, ssh_opts, r, ip, file, ddir))
     return launch_cmd(cmd, timeout)
 
 
-def put_file_scp(ip, file, dest, timeout=600, recursive=True):
+def put_file_scp(ip, file, dest, ssh_opts, timeout=600, recursive=True):
+    if type(ssh_opts) is list:
+        ssh_opts = ' '.join(ssh_opts)
     r = '-r ' if recursive else ''
-    cmd = ("timeout '%s' scp -oStrictHostKeyChecking=no -q %s'%s' '%s':'%s'" %
-           (timeout, r, file, ip, dest))
+    cmd = ("timeout '%s' scp %s -p -q %s'%s' '%s':'%s'" %
+           (timeout, ssh_opts, r, file, ip, dest))
     return launch_cmd(cmd, timeout)
 
 
 def free_space(destdir, timeout):
     cmd = ("df %s --block-size K 2> /dev/null"
-           " | tail -n 1 | awk '{print $2}' | sed 's/K//g'") % (destdir)
+           " | tail -n 1 | awk '{print $4}' | sed 's/K//g'") % (destdir)
     return launch_cmd(cmd, timeout)
 
 
 # wrap non-list into list
 def w_list(value):
     return value if type(value) == list else [value]
+
+
+def all_pairs(items):
+    def incomplete(i_set, p_dict):
+        for i, p_set in p_dict.items():
+            not_paired = i_set.difference(p_set).difference([i])
+            if not_paired:
+                return not_paired
+
+    items_set = set(items)
+    pairs = []
+    paired = {}
+    for i in items_set:
+        paired[i] = set()
+    while incomplete(items_set, paired):
+        busy = set()
+        current_pairs = []
+        for i in [i for i in items if items_set.difference(paired[i])]:
+            can_pair = incomplete(items_set.difference(busy), {i: paired[i]})
+            if i not in busy and can_pair:
+                pair_i = next(iter(can_pair))
+                current_pairs.append([i, pair_i])
+                busy.add(i)
+                busy.add(pair_i)
+                paired[i].add(pair_i)
+        pairs.append(current_pairs)
+    return pairs
 
 
 if __name__ == '__main__':

@@ -18,41 +18,26 @@
 from tools import load_yaml_file
 from tempfile import gettempdir
 import os
+from pkg_resources import resource_filename as resource_fn
+from timmy.env import project_name
 
 
-def load_conf(filename):
+def init_default_conf():
     """Configuration parameters"""
     conf = {}
     conf['hard_filter'] = {}
     conf['soft_filter'] = {}
     conf['ssh_opts'] = ['-oConnectTimeout=2', '-oStrictHostKeyChecking=no',
                         '-oUserKnownHostsFile=/dev/null', '-oLogLevel=error',
-                        '-lroot', '-oBatchMode=yes']
-    conf['env_vars'] = ['OPENRC=/root/openrc', 'IPTABLES_STR="iptables -nvL"',
-                        'LC_ALL="C"', 'LANG="C"']
-    conf['fuel_ip'] = '127.0.0.1'
-    conf['fuel_api_user'] = 'admin'
-    conf['fuel_api_pass'] = 'admin'
-    conf['fuel_api_token'] = None
-    conf['fuel_api_tenant'] = 'admin'
-    conf['fuel_api_port'] = '8000'
-    conf['fuel_api_keystone_port'] = '5000'
-    # The three parameters below are used to override FuelClient, API, CLI auth
-    conf['fuel_user'] = None
-    conf['fuel_pass'] = None
-    conf['fuel_tenant'] = None
-
-    conf['fuelclient'] = True  # use fuelclient library by default
-    conf['fuel_skip_proxy'] = True
-    conf['timeout'] = 15
+                        '-oBatchMode=yes', '-oUser=root']
+    conf['rsync_opts'] = ['-avzP', '--delete-before']
+    conf['env_vars'] = ['OPENRC=/root/openrc', 'LC_ALL="C"', 'LANG="C"']
+    conf['timeout'] = 30
     conf['prefix'] = 'nice -n 19 ionice -c 3'
     rqdir = 'rq'
     rqfile = 'default.yaml'
-    dtm = os.path.join(os.path.abspath(os.sep), 'usr', 'share', 'timmy')
-    if os.path.isdir(os.path.join(dtm, rqdir)):
-        conf['rqdir'] = os.path.join(dtm, rqdir)
-    else:
-        conf['rqdir'] = rqdir
+    data_package = '%s_data' % project_name
+    conf['rqdir'] = os.path.join(resource_fn(data_package, rqdir))
     conf['rqfile'] = [{'file': os.path.join(conf['rqdir'], rqfile),
                       'default': True}]
     conf['compress_timeout'] = 3600
@@ -68,12 +53,6 @@ def load_conf(filename):
     conf['filelists'] = []
     conf['logs'] = []
     conf['logs_no_default'] = False  # skip logs defined in default.yaml
-    conf['logs_fuel_remote_dir'] = ['/var/log/docker-logs/remote',
-                                    '/var/log/remote']
-    conf['logs_no_fuel_remote'] = False  # do not collect /var/log/remote
-    '''Do not collect from /var/log/remote/<node>
-    if node is in the array of nodes filtered out by soft filter'''
-    conf['logs_exclude_filtered'] = True
     conf['logs_days'] = 30
     conf['logs_speed_limit'] = False  # enable speed limiting of log transfers
     conf['logs_speed_default'] = 100  # Mbit/s, used when autodetect fails
@@ -93,7 +72,13 @@ def load_conf(filename):
     conf['do_print_results'] = False
     '''Clean - erase previous results in outdir and archive_dir dir, if any.'''
     conf['clean'] = True
-    if filename:
+    conf['analyze'] = False
+    conf['offline'] = False  # mark all nodes as offline
+    return conf
+
+
+def update_conf(conf, filename):
+    if filename is not None:
         conf_extra = load_yaml_file(filename)
         conf.update(**conf_extra)
     return conf
@@ -101,5 +86,6 @@ def load_conf(filename):
 
 if __name__ == '__main__':
     import yaml
-    conf = load_conf('config.yaml')
+    conf = init_default_conf()
+    conf = update_conf(conf, 'config.yaml')
     print(yaml.dump(conf))

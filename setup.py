@@ -17,20 +17,15 @@
 
 
 from setuptools import setup
-import os
 from timmy.env import project_name, version
+import sys
 
 pname = project_name
-dtm = os.path.join(os.path.abspath(os.sep), 'usr', 'share', pname)
-rqfiles = [(os.path.join(dtm, root), [os.path.join(root, f) for f in files])
-           for root, dirs, files in os.walk('rq')]
-rqfiles.append((os.path.join(dtm, 'config'),
-                [os.path.join('config', 'example.yaml')]))
-package_data = True
 
-if os.environ.get("READTHEDOCS", False):
-    rqfiles = None
-    package_data = False
+if sys.argv[1] == 'test':
+    setup_requires = ['pytest-runner']
+else:
+    setup_requires = []
 
 
 setup(name=pname,
@@ -43,9 +38,13 @@ setup(name=pname,
                    'operations: two-way data transfer, log collection, '
                    'remote command execution'),
       long_description=open('README.md').read(),
-      packages=[pname],
+      packages=[pname,
+                '%s.analyze_modules' % pname,
+                '%s.modules' % pname,
+                '%s_data' % pname],
       install_requires=['pyyaml'],
-      data_files=rqfiles,
-      include_package_data=package_data,
+      include_package_data=True,
       entry_points={'console_scripts': ['%s=%s.cli:main' % (pname, pname)]},
+      setup_requires=setup_requires,
+      tests_require=['pytest']
       )
