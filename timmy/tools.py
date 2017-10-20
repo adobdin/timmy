@@ -49,6 +49,14 @@ while 1:
 '''
 
 
+def print_and_exit(code):
+    msg = ('An error occured, exiting with code %s. See log or documentation'
+           ' for details.')
+    logger.error(msg % code)
+    print(msg % code)
+    sys.exit(code)
+
+
 def signal_wrapper(f):
     def wrapper(*args, **kwargs):
         setup_handle_sig()
@@ -64,7 +72,7 @@ def signal_wrapper(f):
                 if not k.startswith('__') and k != 'message':
                     v = getattr(e, k)
                     logger.debug('Error details: %s = %s' % (k, v))
-            sys.exit(113)
+            print_and_exit(113)
     return wrapper
 
 
@@ -86,7 +94,7 @@ def main_handle_sig(sig, frame):
                 os.kill(int(pid), sig)
             except OSError:
                 pass
-    sys.exit(sig)
+    print_and_exit(sig)
 
 
 def sub_handle_sig(sig, frame):
@@ -97,7 +105,7 @@ def sub_handle_sig(sig, frame):
         os.killpg(os.getpid(), sig)
     except OSError:
         pass
-    sys.exit(sig)
+    print_and_exit(sig)
 
 
 def setup_handle_sig(subprocess=False):
@@ -196,7 +204,7 @@ def run_batch(item_list, maxthreads, dict_result=False):
                     for line in exc_text.splitlines():
                         logger.critical('____%s' % line)
                     cleanup(l)
-                    sys.exit(109)
+                    print_and_exit(109)
                 remove_procs.append(key)
         for key in remove_procs:
             logger.debug(rem_msg % key)
@@ -243,10 +251,10 @@ def load_json_file(filename):
     except IOError as e:
         logger.critical("I/O error(%s): file: %s; msg: %s" %
                         (e.errno, e.filename, e.strerror))
-        sys.exit(107)
+        print_and_exit(107)
     except ValueError:
         logger.critical("Could not convert data", exc_info=True)
-        sys.exit(108)
+        print_and_exit(108)
 
 
 def load_yaml_file(filename):
@@ -255,18 +263,18 @@ def load_yaml_file(filename):
     """
     try:
         with open(filename, 'r') as f:
-            return yaml.load(f)
+            return yaml.safe_load(f)
     except IOError as e:
         logger.critical("I/O error(%s): file: %s; msg: %s" %
                         (e.errno, e.filename, e.strerror))
-        sys.exit(102)
+        print_and_exit(102)
     except ValueError:
         logger.critical("Could not convert data", exc_info=True)
-        sys.exit(103)
+        print_and_exit(103)
     except yaml.parser.ParserError as e:
         logger.critical("Could not parse %s:\n%s" %
                         (filename, str(e)))
-        sys.exit(105)
+        print_and_exit(104)
 
 
 def mdir(directory):
@@ -279,10 +287,10 @@ def mdir(directory):
             os.makedirs(directory)
         except OSError:
             logger.critical("Can't create a directory: %s" % directory)
-            sys.exit(110)
+            print_and_exit(110)
 
 
-def launch_cmd(cmd, timeout, input=None, ok_codes=None, decode=True):
+def launch_cmd(cmd, timeout, input=None, ok_codes=None):
     def _timeout_terminate(pid):
         try:
             os.kill(pid, 15)
@@ -303,26 +311,25 @@ def launch_cmd(cmd, timeout, input=None, ok_codes=None, decode=True):
         timeout_killer = threading.Timer(timeout, _timeout_terminate, [p.pid])
         timeout_killer.start()
         outs, errs = p.communicate(input=input)
-        errs = errs.rstrip('\n')
-        if decode:
-            outs = outs.decode('utf-8')
-            errs = errs.decode('utf-8')
     finally:
         if timeout_killer:
             timeout_killer.cancel()
-        input = input.decode('utf-8') if input else None
-        logger.debug(('___command: %s\n'
-                      '_______pid: %s\n'
-                      '_exit_code: %s\n'
-                      '_____stdin: %s\n'
-                      '____stderr: %s') % (cmd, p.pid, p.returncode, input,
-                                           errs))
+        if logger.isEnabledFor(logging.DEBUG):
+            # p_out = unicode(outs, 'utf-8', 'replace')
+            p_err = unicode(errs, 'utf-8', 'replace').rstrip('\n')
+            p_inp = unicode(input, 'utf-8', 'replace') if input else None
+            logger.debug(('___command: %s\n'
+                          '_______pid: %s\n'
+                          '_exit_code: %s\n'
+                          '_____stdin: %s\n'
+                          '____stderr: %s') % (cmd, p.pid, p.returncode, p_inp,
+                                               p_err))
     return outs, errs, p.returncode
 
 
 def ssh_node(ip, command='', ssh_opts=None, env_vars=None, timeout=15,
              filename=None, inputfile=None, outputfile=None,
-             ok_codes=None, input=None, prefix=None, decode=True):
+             ok_codes=None, input=None, prefix=None):
     if not ssh_opts:
         ssh_opts = ''
     if not env_vars:
@@ -354,7 +361,7 @@ def ssh_node(ip, command='', ssh_opts=None, env_vars=None, timeout=15,
            "trap 'kill $pid' 2; echo -n \"$input\" | xxd -r -p | " + cmd +
            ' &:; pid=$!; wait $!')
     return launch_cmd(cmd, timeout, input=input,
-                      ok_codes=ok_codes, decode=decode)
+                      ok_codes=ok_codes)
 
 
 def get_files_rsync(ip, data, ssh_opts, rsync_opts, dpath, timeout=15):
@@ -408,32 +415,36 @@ def w_list(value):
     return value if type(value) == list else [value]
 
 
-def all_pairs(items):
-    def incomplete(i_set, p_dict):
-        for i, p_set in p_dict.items():
-            not_paired = i_set.difference(p_set).difference([i])
-            if not_paired:
-                return not_paired
+def all_pairs(items, one_way=False, max_pairs=0):
+    def incomplete(items_set, paired_dict):
+        for paired_set in paired_dict.values():
+            if items_set.difference(paired_set):
+                return True
 
     items_set = set(items)
     pairs = []
     paired = {}
     for i in items_set:
-        paired[i] = set()
+        paired[i] = set([i])
     while incomplete(items_set, paired):
         busy = set()
         current_pairs = []
-        for i in [i for i in items if items_set.difference(paired[i])]:
-            can_pair = incomplete(items_set.difference(busy), {i: paired[i]})
-            if i not in busy and can_pair:
-                pair_i = next(iter(can_pair))
-                current_pairs.append([i, pair_i])
-                busy.add(i)
-                busy.add(pair_i)
-                paired[i].add(pair_i)
+        for i in items_set:
+            if items_set.difference(paired[i]) and i not in busy:
+                can_pair = items_set.difference(busy).difference(paired[i])
+                if can_pair:
+                    pair_i = can_pair.pop()
+                    current_pairs.append([i, pair_i])
+                    busy.add(i)
+                    busy.add(pair_i)
+                    paired[i].add(pair_i)
+                    if one_way:
+                        paired[pair_i].add(i)
+                    if max_pairs and len(busy) >= max_pairs:
+                        break
         pairs.append(current_pairs)
     return pairs
 
 
 if __name__ == '__main__':
-    sys.exit(0)
+    pass

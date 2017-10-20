@@ -4,7 +4,7 @@
 %global pypi_name timmy
 
 Name:           python-%{pypi_name}
-Version:        1.25.5
+Version:        1.26.11
 Release:        1%{?dist}~mos0
 Summary:        Log collector tool for OpenStack Fuel
 
@@ -107,6 +107,50 @@ popd
 
 
 %changelog
+* Wed Mar 22 2017 Dmitrii Kabanov <dkabanov@mirantis.com> - 1.26.11
+- Change: prepend conf.env_vars to scripts with env vars
+
+* Mon Mar 20 2017 Dmitrii Kabanov <dkabanov@mirantis.com> - 1.26.10
+- Change: use environment variable for openrc in SPT
+
+* Tue Mar 14 2017 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.9
+- Add: collect ceilometer & aodh config
+- Fix: add "fuel2 task list" for 10.x series
+
+* Fri Feb 24 2017 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.8
+- Fix: exec_pair trace; SPT bugs; print non-0 exit
+
+* Thu Feb 23 2017 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.7
+- Fix: UnicodeDecodeError, broken spec; add SPT
+- Update documentation to match timmy 1.26.6 code
+- Fix: CLI docs
+
+* Thu Jan 19 2017 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.6
+- Add yum.repos.d directory to snapshot
+- Change: print only summary for analysis module if all nodes are ok
+- Replace yaml.load() with yaml.safe_load()
+- Change: minor changes in analyze & rabbitmq module
+- Added: stderr for mapping scripts
+
+* Tue Dec 27 2016 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.5
+- Change: minor changes in analyze & rabbitmq module
+- Add: stderr for mapping scripts
+
+* Thu Dec 22 2016 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.4
+- Add: max_pairs argument; other minor changes
+
+* Wed Dec 21 2016 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.3
+- Fix: scripts_all_pairs sometimes uses same node
+
+* Tue Dec 20 2016 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.26.2
+- Add: rabbitmq analysis module
+
+* Tue Dec 20 2016 Aleksandr Dobdin <adobdin@mirantis.com> - 1.26.1
+- Fix: download network templates for 9.1
+
+* Thu Dec 15 2016 Alexander Lemeshko <oliemieshko@mirantis.com> - 1.26.0
+- Add: scripts_all_pairs 'one way' mode
+
 * Wed Dec 14 2016 Dmitry Sutyagin <dsutyagin@mirantis.com> - 1.25.5
 - Fix: RuntimeWarning when using analyze
 

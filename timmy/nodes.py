@@ -24,12 +24,11 @@ from datetime import datetime, date, timedelta
 from timmy import conf
 from timmy.env import project_name, version
 from timmy import tools
-from tools import w_list, run_with_lock
+from tools import w_list, run_with_lock, print_and_exit
 import logging
 import os
 import re
 import shutil
-import sys
 
 
 class Node(object):
@@ -65,7 +64,7 @@ class Node(object):
         self.status = status
         if ip is None:
             self.logger.critical('Node: ip address must be defined')
-            sys.exit(111)
+            print_and_exit(111)
         self.ip = ip
         self.network_data = network_data
         self.release = None
@@ -200,11 +199,10 @@ class Node(object):
     def generate_mapscr(self):
         mapscr = {}
         for scr in self.scripts:
+            env_vars = ' '.join(self.env_vars)
             if type(scr) is dict:
-                env_vars = scr.values()[0]
+                env_vars += ' %s' % scr.values()[0]
                 scr = scr.keys()[0]
-            else:
-                env_vars = self.env_vars
             if os.path.sep in scr:
                 script_path = scr
             else:
@@ -212,12 +210,14 @@ class Node(object):
             self.logger.debug('%s, exec: %s' % (self.repr, script_path))
             output_path = os.path.join(self.scripts_ddir,
                                        os.path.basename(script_path))
+            stderr_path = "%s.stderr" % output_path
             if self.outputs_timestamp:
                 output_path += self.outputs_timestamp_str
             self.logger.debug('outfile: %s' % output_path)
             mapscr[scr] = {'env_vars': env_vars,
                            'script_path': script_path,
-                           'output_path': output_path}
+                           'output_path': output_path,
+                           'stderr_path': stderr_path}
         self.mapscr = mapscr
 
     def exec_cmd(self, fake=False, ok_codes=None):
@@ -232,6 +232,8 @@ class Node(object):
         for c in self.cmds:
             for cmd in c:
                 dfile = os.path.join(ddir, cmd)
+                errf = '%s.stderr' % dfile
+
                 if self.outputs_timestamp:
                         dfile += self.outputs_timestamp_str
                 self.logger.info('outfile: %s' % dfile)
@@ -244,13 +246,22 @@ class Node(object):
                                                       env_vars=self.env_vars,
                                                       timeout=self.timeout,
                                                       prefix=self.prefix)
-                    self.check_code(code, 'exec_cmd', c[cmd], errs, ok_codes)
+                    ec = self.check_code(code, 'exec_cmd',
+                                         c[cmd], errs, ok_codes)
                     try:
                         with open(dfile, 'w') as df:
-                            df.write(outs.encode('utf-8'))
-                    except:
+                            df.write(outs)
+                    except IOError:
                         self.logger.error("can't write to file %s" %
                                           dfile)
+                    if ec:
+                        try:
+                            with open(errf, 'w') as ef:
+                                ef.write('exitcode: %s\n' % code)
+                                ef.write(errs)
+                        except IOError:
+                            self.logger.error("can't write to file %s" %
+                                              errf)
         if self.scripts:
             self.generate_mapscr()
             tools.mdir(self.scripts_ddir)
@@ -263,18 +274,27 @@ class Node(object):
                                               env_vars=param['env_vars'],
                                               timeout=self.timeout,
                                               prefix=self.prefix)
-            self.check_code(code, 'exec_cmd',
-                            'script %s' % param['script_path'], errs, ok_codes)
+            ec = self.check_code(code, 'exec_cmd',
+                                 ('script %s' % param['script_path']),
+                                 errs, ok_codes)
             try:
                 with open(param['output_path'], 'w') as df:
-                    df.write(outs.encode('utf-8'))
-            except:
-                self.logger.error("can't write to file %s"
-                                  % param['output_path'])
+                    df.write(outs)
+            except IOError:
+                self.logger.error("can't write to file %s" %
+                                  param['output_path'])
+            if not ec:
+                try:
+                    with open(param['stderr_path'], 'w') as ef:
+                        ef.write('exitcode: %s\n' % code)
+                        ef.write(errs)
+                except IOError:
+                    self.logger.error("can't write to file %s" %
+                                      param['stderr_path'])
         return mapcmds, self.mapscr
 
     def exec_simple_cmd(self, cmd, timeout=15, infile=None, outfile=None,
-                        fake=False, ok_codes=None, input=None, decode=True):
+                        fake=False, ok_codes=None, input=None):
         self.logger.info('%s, exec: %s' % (self.repr, cmd))
         if not fake:
             outs, errs, code = tools.ssh_node(ip=self.ip,
@@ -284,7 +304,6 @@ class Node(object):
                                               timeout=timeout,
                                               outputfile=outfile,
                                               ok_codes=ok_codes,
-                                              decode=decode,
                                               input=input,
                                               prefix=self.prefix)
             self.check_code(code, 'exec_simple_cmd', cmd, errs, ok_codes)
@@ -316,7 +335,9 @@ class Node(object):
                     nd = sn.network_data
                     net_dict = dict((v['name'], v) for v in nd)
                     if i['network'] not in net_dict:
-                        self.logger.warning(nonet_msg % (self.repr, sn.repr))
+                        self.logger.warning(nonet_msg % (self.repr,
+                                                         i['network'],
+                                                         sn.repr))
                         return self.scripts_all_pairs
                     if 'ip' not in net_dict[i['network']]:
                         self.logger.warning(noip_msg % (self.repr, sn.repr,
@@ -380,7 +401,7 @@ class Node(object):
                     for line in df:
                         if not line.isspace() and line[0] != '#':
                             data += line
-            except:
+            except IOError:
                 self.logger.error('could not read file: %s' % fname)
         self.logger.debug('%s: data:\n%s' % (self.repr, data))
         if data:
@@ -493,9 +514,12 @@ class Node(object):
     def check_code(self, code, func_name, cmd, err, ok_codes=None):
         if code:
             if not ok_codes or code not in ok_codes:
+                p_err = unicode(err, 'utf-8', 'replace').rstrip('\n')
                 self.logger.warning("%s: func: %s: "
                                     "cmd: '%s' exited %d, error: %s" %
-                                    (self.repr, func_name, cmd, code, err))
+                                    (self.repr, func_name, cmd, code, p_err))
+                return False
+        return True
 
     def get_results(self, result_map):
         # result_map should be either mapcmds or mapscr
@@ -538,6 +562,8 @@ class NodeManager(object):
 
     def base_init(self, conf, logger=None):
         self.conf = conf
+        self.maxthreads = conf['maxthreads']  # shortcut
+        self.logs_maxthreads = conf['maxthreads']  # shortcut
         self.logger = logger or logging.getLogger(project_name)
         if conf['outputs_timestamp'] or conf['dir_timestamp']:
             timestamp_str = datetime.now().strftime('_%F_%H-%M-%S')
@@ -561,7 +587,7 @@ class NodeManager(object):
             if (not os.path.exists(self.rqdir)):
                 self.logger.critical(('NodeManager: directory %s does not'
                                       ' exist') % self.rqdir)
-                sys.exit(101)
+                print_and_exit(101)
             if self.conf['rqfile']:
                 self.import_rq()
         self.nodes = {}
@@ -711,23 +737,23 @@ class NodeManager(object):
         for node in self.nodes.values():
             node.apply_conf(self.conf)
 
-    def nodes_get_os(self, maxthreads=100):
+    def nodes_get_os(self):
         run_items = []
         for key, node in self.selected_nodes.items():
             if not node.os_platform:
                 run_items.append(tools.RunItem(target=node.get_os, key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
+        result = tools.run_batch(run_items, self.maxthreads, dict_result=True)
         for key in result:
             if result[key]:
                 self.nodes[key].os_platform = result[key]
 
-    def nodes_check_access(self, maxthreads=100):
+    def nodes_check_access(self):
         self.logger.debug('checking if nodes are accessible')
         run_items = []
         for key, node in self.selected_nodes.items():
             run_items.append(tools.RunItem(target=node.check_access,
                                            key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
+        result = tools.run_batch(run_items, self.maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].accessible = result[key]
 
@@ -759,25 +785,25 @@ class NodeManager(object):
             return all(checks)
 
     @run_with_lock
-    def run_commands(self, timeout=15, fake=False, maxthreads=100):
+    def run_commands(self, timeout=15, fake=False):
         run_items = []
         for key, node in self.selected_nodes.items():
             run_items.append(tools.RunItem(target=node.exec_cmd,
                                            args={'fake': fake},
                                            key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
+        result = tools.run_batch(run_items, self.maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].mapcmds = result[key][0]
             self.nodes[key].mapscr = result[key][1]
 
-    def calculate_log_size(self, timeout=15, maxthreads=100):
+    def calculate_log_size(self, timeout=15):
         total_size = 0
         run_items = []
         for key, node in self.selected_nodes.items():
             run_items.append(tools.RunItem(target=node.logs_populate,
                                            args={'timeout': timeout},
                                            key=key))
-        result = tools.run_batch(run_items, maxthreads, dict_result=True)
+        result = tools.run_batch(run_items, self.maxthreads, dict_result=True)
         for key in result:
             self.nodes[key].logs = result[key]
         for node in self.selected_nodes.values():
@@ -796,7 +822,7 @@ class NodeManager(object):
             return False
         try:
             fs = int(outs.rstrip('\n'))
-        except:
+        except ValueError:
             self.logger.error("can't get free space\nouts: %s" %
                               outs)
             return False
@@ -842,12 +868,12 @@ class NodeManager(object):
                     return self.conf['logs_speed_default']
                 try:
                     speed = int(out)
-                except:
+                except ValueError:
                     speed = self.conf['logs_speed_default']
                 return speed
 
     @run_with_lock
-    def get_logs(self, timeout, fake=False, maxthreads=10):
+    def get_logs(self, timeout, fake=False):
         if fake:
             self.logger.info('fake = True, skipping')
             return
@@ -856,7 +882,8 @@ class NodeManager(object):
                 speed = self.conf['logs_speed']
             else:
                 speed = self.find_adm_interface_speed()
-            speed = int(speed * 0.9 / min(maxthreads, len(self.nodes)))
+            speed = int(speed * 0.9 / min(self.logs_maxthreads,
+                                          len(self.nodes)))
             py_slowpipe = tools.slowpipe % speed
             limitcmd = "| python -c '%s'; exit ${PIPESTATUS}" % py_slowpipe
         run_items = []
@@ -880,11 +907,10 @@ class NodeManager(object):
                     'timeout': timeout,
                     'outfile': node.archivelogsfile,
                     'input': input,
-                    'ok_codes': [0, 1],
-                    'decode': False}
+                    'ok_codes': [0, 1]}
             run_items.append(tools.RunItem(target=node.exec_simple_cmd,
                                            args=args))
-        tools.run_batch(run_items, maxthreads)
+        tools.run_batch(run_items, self.logs_maxthreads)
 
     @run_with_lock
     def get_files(self, timeout=15):
@@ -901,14 +927,16 @@ class NodeManager(object):
         tools.run_batch(run_items, 10)
 
     @run_with_lock
-    def run_scripts_all_pairs(self, maxthreads, fake=False):
-        if len(self.selected_nodes) < 2:
+    def run_scripts_all_pairs(self, fake=False):
+        nodes = self.selected_nodes.values()
+        max_pairs = self.conf['scripts_all_pairs_max_pairs']
+        if len(nodes) < 2:
             self.logger.warning('less than 2 nodes are available, '
                                 'skipping paired scripts')
             return
         run_server_start_items = []
         run_server_stop_items = []
-        for n in self.selected_nodes.values():
+        for n in nodes:
             start_args = {'phase': 'server_start', 'fake': fake}
             run_server_start_items.append(tools.RunItem(target=n.exec_pair,
                                                         args=start_args,
@@ -916,11 +944,13 @@ class NodeManager(object):
             stop_args = {'phase': 'server_stop', 'fake': fake}
             run_server_stop_items.append(tools.RunItem(target=n.exec_pair,
                                                        args=stop_args))
-        result = tools.run_batch(run_server_start_items, maxthreads,
+        result = tools.run_batch(run_server_start_items, self.maxthreads,
                                  dict_result=True)
         for key in result:
             self.nodes[key].scripts_all_pairs = result[key]
-        for pairset in tools.all_pairs(self.selected_nodes.values()):
+        one_way = self.conf['scripts_all_pairs_one_way']
+        chain = tools.all_pairs(nodes, one_way=one_way, max_pairs=max_pairs)
+        for pairset in chain:
             run_client_items = []
             self.logger.info(['%s->%s' % (p[0].ip, p[1].ip) for p in pairset])
             for pair in pairset:
@@ -931,7 +961,7 @@ class NodeManager(object):
                 run_client_items.append(tools.RunItem(target=client.exec_pair,
                                                       args=client_args))
             tools.run_batch(run_client_items, len(run_client_items))
-        tools.run_batch(run_server_stop_items, maxthreads)
+        tools.run_batch(run_server_stop_items, self.maxthreads)
 
     def has(self, *keys):
         nodes = {}
@@ -950,8 +980,5 @@ class NodeManager(object):
         return dict([(ip, n) for ip, n in self.nodes.items() if not n.skipped])
 
 
-def main(argv=None):
-    return 0
-
 if __name__ == '__main__':
-    sys.exit(main(sys.argv))
+    pass
